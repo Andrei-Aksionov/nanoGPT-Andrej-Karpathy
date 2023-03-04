@@ -377,7 +377,7 @@ class GPT(nn.Module):
         # in the beginning initialize kv-cache either as None if kv-cache is disabled, or as empty tensors
         if use_kv_cache:
             kv_cache = [
-                tuple(torch.empty(0, device=idx.device) for _ in range(2)) # empty tensor for key and for value
+                tuple(torch.empty(0, device=idx.device, dtype=idx.dtype) for _ in range(2)) # empty tensor for key and for value
                 for _ in range(self.config.n_layer) # for each layer
             ]
             # kv_cache = [torch.empty(2, 0, device=idx.device) for _ in range(self.config.n_layer)]
