@@ -74,6 +74,7 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
+print(f"{start=}")
 # encode the beginning of the prompt
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
@@ -82,7 +83,7 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 from time import perf_counter
-start = perf_counter()
+start_time = perf_counter()
 # run generation
 with torch.no_grad():
     with ctx:
@@ -91,4 +92,4 @@ with torch.no_grad():
             print(decode(y[0].tolist()))
             print('---------------')
 
-print(f"Time took: {perf_counter() - start:.2f}")
+print(f"Time took: {perf_counter() - start_time:.2f}")

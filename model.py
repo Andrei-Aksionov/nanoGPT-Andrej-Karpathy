@@ -54,7 +54,7 @@ class CausalSelfAttention(nn.Module):
         # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and self.dropout == 0.0
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
+            # print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
@@ -69,11 +69,9 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if past is not None:
-            # TODO: add sizes
-            k_past, v_past = past
-            # k_past, v_past = past.unbind(0)
-            k = torch.cat((k_past, k), dim=-2)
-            v = torch.cat((v_past, v), dim=-2)
+            k_past, v_past = past # ((B, nh, T, hs), (B, nh, T, hs))
+            k = torch.cat((k_past, k), dim=-2) # (B, nh, past + T, hs)
+            v = torch.cat((v_past, v), dim=-2) # (B, nh, past + T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -92,9 +90,8 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
 
         # new kv-cache is None if kv-cache is disabled
-        # present = None if past is None else torch.stack((k, v))
         present = None if past is None else (k, v)
-        # return y and kv-cache
+        # return y and new kv-cache
         return y, present
 
 class MLP(nn.Module):
@@ -189,14 +186,15 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past=None, pos_idx=None):
+    def forward(self, idx, targets=None, past=None):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        if pos_idx is not None:
-            # TODO: check sizings
+        # if past is provided and it's not a list of Nones or empty tensors
+        if past and past[0] and past[0][0].numel():
+            pos_idx = past[0][0].size(-2)  # past of shape: num_layers * ((B, nh, T, hs), (B, nh, T, hs))
             pos_emb = self.transformer.wpe.weight[None, None, pos_idx] # (1, 1, n_embd)
         else:
             pos_emb = self.transformer.wpe.weight[None, :t] # position embeddings of shape (1, t, n_embd)
@@ -205,7 +203,6 @@ class GPT(nn.Module):
         # iterate over each transformer layer and corresponding kv-cache
         # and save updated kv-cache values in `presents` list
         presents = []
-        past = past or [None] * self.config.n_layer
         for block, past_layer in zip(self.transformer.h, past):
             x, present = block(x, past_layer)
             presents.append(present)
@@ -370,24 +367,29 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        if use_kv_cache and max_new_tokens > self.config.block_size:
-            msg = "With kv-cache number of new tokens should not be greater than block/context size of the model, "
-            f"but was requested '{max_new_tokens}' new tokens with model's block/context size of '{self.config.block_size}'",
+        if use_kv_cache and (max_new_tokens + idx.size(-1) - 1) > self.config.block_size:
+            msg = (
+                "With kv-cache the number of new tokens should not be greater than context size of the model "
+                f"plus size of initial context, but was requested '{max_new_tokens}' new tokens "
+                f"with initial context of size '{idx.shape[-1]}' and '{self.config.block_size}' context size of the model"
+            )
             raise ValueError(msg)
-        # in the beginning initialize kv-cache either as None if kv-cache is disabled, or as empty tensors
+        # in the beginning initialize kv-cache either as None values if kv-cache is disabled, or as empty tensors if enabled
         if use_kv_cache:
             kv_cache = [
                 tuple(torch.empty(0, device=idx.device, dtype=idx.dtype) for _ in range(2)) # empty tensor for key and for value
                 for _ in range(self.config.n_layer) # for each layer
             ]
-            # kv_cache = [torch.empty(2, 0, device=idx.device) for _ in range(self.config.n_layer)]
         else:
-            kv_cache = None
+            kv_cache = [None] * self.config.n_layer
         for iteration in trange(max_new_tokens):
             # if to use kv-cache: crop to the last token; if not - crop by block_size
-            idx_cond = idx[:, -1:] if use_kv_cache else idx[:, -self.config.block_size:]
+            if not use_kv_cache or (iteration == 0 and idx.size(-1) > 1):
+                idx_cond = idx[:, -self.config.block_size:]
+            else:
+                idx_cond = idx[:, -1:]
             # forward the model to get the logits for the index in the sequence
-            logits, kv_cache = self(idx_cond, past=kv_cache, pos_idx=iteration if use_kv_cache else None)
+            logits, kv_cache = self(idx_cond, past=kv_cache)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
